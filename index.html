@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>Dashboard ORP</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; background: #f5f5f5 }
+    h1 { text-align: center }
+    .controls, .summary, .charts {
+      display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 16px;
+    }
+    .controls > * { flex: 1; min-width: 160px }
+    .summary div, .chart-container {
+      background: white; padding: 12px; border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      flex: 1; min-width: 180px;
+    }
+    .chart-container { position: relative; height: 280px }
+    button { padding: 8px }
+  </style>
+</head>
+<body>
+  <h1>Dashboard ORP</h1>
+
+  <div class="controls">
+    <!-- Rango de tiempo -->
+    <label>Desde: <input type="datetime-local" id="from"></label>
+    <label>Hasta: <input type="datetime-local" id="to"></label>
+    <button id="applyFilter">Aplicar Filtro</button>
+    <button id="exportCSV">Exportar CSV</button>
+    <button id="exportJSON">Exportar JSON</button>
+  </div>
+
+  <div class="summary">
+    <div>Actual: <strong id="current">–</strong></div>
+    <div>Máximo: <strong id="max">–</strong></div>
+    <div>Mínimo: <strong id="min">–</strong></div>
+    <div>Media Móvil: <strong id="rolling">–</strong></div>
+    <div>Desv. Estándar: <strong id="stddev">–</strong></div>
+  </div>
+
+  <div class="charts">
+    <div class="chart-container"><canvas id="timeChart"></canvas></div>
+    <div class="chart-container"><canvas id="histChart"></canvas></div>
+    <div class="chart-container"><canvas id="gaugeChart"></canvas></div>
+  </div>
+
+  <!-- Dependencias -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <script src="https://cdn.jsdelivr.net/npm/moment@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-moment@1"></script>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js"></script>
+
+  <script>
+    console.clear();
+    let rawData = [], filtered = [];
+    const rollingWindow = 20;
+    const CSV_URL = 'https://raw.githubusercontent.com/hermecp/Dashboard-ORP/main/ORP-orpValue.csv';
+
+    function toLocalInput(d) {
+      const pad = n => String(n).padStart(2,'0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
+           + `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    }
+
+    // Inicializar gráficos
+    const timeChart = new Chart(
+      document.getElementById('timeChart'),
+      {
+        type: 'line',
+        data: { datasets: [
+          { label: 'Valor', data: [], pointRadius: 0, tension: 0.2 },
+          { label: 'Media Móvil', data: [], borderDash: [5,5], pointRadius: 0, tension: 0.2 },
+          { label: 'Anomalías', data: [], type: 'scatter', pointRadius: 5, backgroundColor: 'red' }
+        ]},
+        options: {
+          scales: {
+            x: { type: 'time', time: { tooltipFormat: 'DD LLL yyyy, HH:mm:ss' }, title: { display:true, text:'Tiempo' } },
+            y: { title:{ display:true, text:'ORP' } }
+          },
+          plugins: { legend:{ position:'bottom' } }
+        }
+      }
+    );
+
+    const histChart = new Chart(
+      document.getElementById('histChart'),
+      {
+        type: 'bar',
+        data: { labels: [], datasets:[{ label:'Frecuencia', data:[] }] },
+        options: {
+          scales: {
+            x:{ title:{ display:true, text:'Bins' } },
+            y:{ title:{ display:true, text:'Cuenta' } }
+          }
+        }
+      }
+    );
+
+    const gaugeChart = new Chart(
+      document.getElementById('gaugeChart'),
+      {
+        type: 'doughnut',
+        data: { labels:['%','resto'], datasets:[{ data:[0,100], backgroundColor:['#4caf50','#ddd'] }] },
+        options: { rotation:-90, circumference:180, plugins:{ legend:{display:false}, tooltip:{enabled:false} } }
+      }
+    );
+
+    function updateDashboard() {
+      if (!filtered.length) return;
+      const vals = filtered.map(d=>d.value);
+      const current = vals.at(-1), mx = Math.max(...vals), mn = Math.min(...vals);
+      document.getElementById('current').textContent = current;
+      document.getElementById('max').textContent = mx;
+      document.getElementById('min').textContent = mn;
+
+      const mean = vals.reduce((a,b)=>a+b,0)/vals.length;
+      const stddev = Math.sqrt(vals.map(v=>(v-mean)**2).reduce((a,b)=>a+b,0)/vals.length);
+      const rollingAvg = vals.slice(-rollingWindow).reduce((a,b)=>a+b,0)/Math.min(vals.length,rollingWindow);
+      document.getElementById('rolling').textContent = rollingAvg.toFixed(2);
+      document.getElementById('stddev').textContent = stddev.toFixed(2);
+
+      // Serie temporal
+      const serie = filtered.map(d=>({ x:d.time, y:d.value }));
+      const rollingSerie = filtered.map((d,i)=>{
+        if (i<rollingWindow-1) return null;
+        const slice = vals.slice(i-rollingWindow+1,i+1);
+        const avg = slice.reduce((a,b)=>a+b,0)/rollingWindow;
+        return { x:d.time, y:avg };
+      }).filter(x=>x);
+      const anomalies = filtered.filter(d=> d.value>mean+2*stddev || d.value<mean-2*stddev)
+                                .map(d=>({ x:d.time, y:d.value }));
+
+      timeChart.data.datasets[0].data = serie;
+      timeChart.data.datasets[1].data = rollingSerie;
+      timeChart.data.datasets[2].data = anomalies;
+      timeChart.update();
+
+      // Histograma
+      const bins = 20, span = (mx-mn)/bins;
+      const counts = Array(bins).fill(0);
+      vals.forEach(v=>{
+        const idx = Math.min(Math.floor((v-mn)/span), bins-1);
+        counts[idx]++;
+      });
+      histChart.data.labels = counts.map((_,i)=>(mn + i*span).toFixed(1));
+      histChart.data.datasets[0].data = counts;
+      histChart.update();
+
+      // Gauge
+      const pct = Math.round(100*current/mx);
+      gaugeChart.data.datasets[0].data = [pct,100-pct];
+      gaugeChart.update();
+    }
+
+    // Filtrar rangos
+    document.getElementById('applyFilter').onclick = ()=>{
+      const from = new Date(document.getElementById('from').value).getTime();
+      const to   = new Date(document.getElementById('to').value).getTime();
+      filtered = rawData.filter(d=>{
+        const t = d.time;
+        return (!isNaN(from)? t>=from : true) &&
+               (!isNaN(to)  ? t<=to   : true);
+      });
+      updateDashboard();
+    };
+
+    // Exportar
+    function download(fn, content) {
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([content],{type:'text/plain'}));
+      a.download = fn; a.click();
+    }
+    document.getElementById('exportCSV').onclick = ()=>{
+      const csv = Papa.unparse(filtered.map(d=>({
+        time: new Date(d.time).toISOString(),
+        value: d.value
+      })));
+      download('resumen.csv',csv);
+    };
+    document.getElementById('exportJSON').onclick = ()=>{
+      download('resumen.json',JSON.stringify(filtered,null,2));
+    };
+
+    // Carga automática desde GitHub
+    Papa.parse(CSV_URL, {
+      download: true,
+      header: true,
+      dynamicTyping: true,
+      skipEmptyLines: true,
+      complete: ({ data })=>{
+        rawData = data
+          .filter(r=> r.time && r.value!=null )
+          .map(r=>({
+            time: moment(r.time).valueOf(),  // epoch ms
+            value: r.value
+          }));
+        filtered = [...rawData];
+        console.log('Datos cargados:', rawData.length);
+
+        if (rawData.length) {
+          const d0 = new Date(rawData[0].time),
+                d1 = new Date(rawData.at(-1).time);
+          document.getElementById('from').value = toLocalInput(d0);
+          document.getElementById('to').  value = toLocalInput(d1);
+        }
+        updateDashboard();
+      }
+    });
+  </script>
+</body>
+</html>
